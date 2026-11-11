@@ -5,8 +5,10 @@ package cmd
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -14,6 +16,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/gofrs/flock"
 	"github.com/spf13/cobra"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	clientauthv1beta1 "k8s.io/client-go/pkg/apis/clientauthentication/v1beta1"
@@ -50,6 +53,15 @@ const (
 
 	// The value to use for true/false env vars to enable the behavior caused by the env var.
 	envVarTruthyValue = "true"
+
+	// How long a login waits for another login to the same issuer to finish, before it stops waiting and logs in
+	// by itself (which is how the CLI behaved before this lock existed). A login can legitimately take a while,
+	// for example when the user must also approve a multi-factor prompt. But a login is allowed to run for up to
+	// 90 minutes, and we should not make every other login wait that long for someone who walked away from the browser.
+	issuerLoginLockWaitTimeout = 5 * time.Minute
+
+	// How often a login that is waiting for the issuer lock checks whether the lock is free.
+	issuerLoginLockRetryInterval = 100 * time.Millisecond
 )
 
 //nolint:gochecknoinits
@@ -266,8 +278,19 @@ func runOIDCLogin(cmd *cobra.Command, deps oidcLoginCommandDeps, flags oidcLogin
 	}
 
 	pLogger.Debug("Performing OIDC login", "issuer", flags.issuer, "client id", flags.clientID)
+	// A kubeconfig with many contexts makes tools like k9s start many of these processes at the same moment.
+	// Without a lock, each one that finds no session in the cache opens its own browser login, even when they all
+	// use the same issuer. So wait here until any other login to this issuer is done. The login below starts by
+	// reading the session cache, so a process that waited finds the session the first one saved and does not open
+	// a browser at all.
+	unlockIssuer, _ := lockIssuerLogin(cmd.Context(), flags.sessionCachePath, flags.issuer, issuerLoginLockWaitTimeout, pLogger)
+
 	// Do the basic login to get an OIDC token. Although this can return several tokens, we only need the ID token here.
 	token, err := deps.login(flags.issuer, flags.clientID, opts...)
+
+	// Release the lock before the concierge exchange below, so the exchanges for different contexts can still run in
+	// parallel. Only the login itself needs to take turns.
+	unlockIssuer()
 	if err != nil {
 		return fmt.Errorf("could not complete Pinniped login: %w", err)
 	}
@@ -294,6 +317,60 @@ func runOIDCLogin(cmd *cobra.Command, deps oidcLoginCommandDeps, flags oidcLogin
 		credCache.Put(cacheKey, cred)
 	}
 	return json.NewEncoder(cmd.OutOrStdout()).Encode(cred)
+}
+
+// lockIssuerLogin takes an exclusive lock for logins to the given issuer, so that only one login per issuer runs at
+// a time, and waits up to waitTimeout if another process holds it. It returns a function that releases the lock,
+// and whether the lock was acquired.
+//
+// The lock is a file next to the session cache file, one per issuer. The operating system releases it if the
+// process holding it dies, so a killed login cannot leave other logins stuck.
+//
+// If the lock cannot be taken (for example the wait timed out, or the directory is not writable), this logs a
+// warning and returns a release function that does nothing. The caller then logs in without the lock, which is
+// how the CLI behaved before this lock existed. A problem with the lock must never prevent a login.
+func lockIssuerLogin(
+	ctx context.Context,
+	sessionCachePath string,
+	issuer string,
+	waitTimeout time.Duration,
+	logger plog.Logger,
+) (unlock func(), acquired bool) {
+	doNothing := func() {}
+
+	// With no session cache file there is nothing shared between processes to protect.
+	if sessionCachePath == "" {
+		return doNothing, false
+	}
+
+	// The session cache directory may not exist yet on the very first login, and the lock file lives in it.
+	if err := os.MkdirAll(filepath.Dir(sessionCachePath), 0700); err != nil {
+		logger.WarningErr("could not create the directory for the login lock, so logging in without waiting for other logins", err)
+		return doNothing, false
+	}
+
+	// Hash the issuer URL to get a short file name that is safe on every operating system.
+	issuerHash := sha256.Sum256([]byte(issuer))
+	lock := flock.New(sessionCachePath + "." + hex.EncodeToString(issuerHash[:8]) + ".lock")
+
+	// Try once without waiting, so that the common case (nobody else is logging in) has no delay and no extra log line.
+	locked, err := lock.TryLock()
+	if err == nil && !locked {
+		logger.Debug("Waiting for another login to this issuer to finish", "issuer", issuer)
+		waitCtx, cancel := context.WithTimeout(ctx, waitTimeout)
+		defer cancel()
+		locked, err = lock.TryLockContext(waitCtx, issuerLoginLockRetryInterval)
+	}
+	if err != nil || !locked {
+		logger.WarningErr("could not get the login lock for this issuer, so logging in without waiting for other logins", err, "issuer", issuer)
+		return doNothing, false
+	}
+
+	return func() {
+		if err := lock.Unlock(); err != nil {
+			logger.DebugErr("could not release the login lock", err, "issuer", issuer)
+		}
+	}, true
 }
 
 func makeClient(caBundlePaths []string, caBundleData []string) (*http.Client, error) {

@@ -10,9 +10,12 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/mock/gomock"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -274,8 +277,8 @@ func TestLoginOIDCCommand(t *testing.T) {
 			wantOptionsCount: 4,
 			wantStdout:       `{"kind":"ExecCredential","apiVersion":"client.authentication.k8s.io/v1beta1","spec":{"interactive":false},"status":{"expirationTimestamp":"3020-10-12T13:14:15Z","token":"test-id-token"}}` + "\n",
 			wantLogs: []string{
-				nowStr + `  cmd/login_oidc.go:268  Performing OIDC login  {"issuer": "test-issuer", "client id": "test-client-id"}`,
-				nowStr + `  cmd/login_oidc.go:288  No concierge configured, skipping token credential exchange`,
+				nowStr + `  cmd/login_oidc.go:280  Performing OIDC login  {"issuer": "test-issuer", "client id": "test-client-id"}`,
+				nowStr + `  cmd/login_oidc.go:311  No concierge configured, skipping token credential exchange`,
 			},
 		},
 		{
@@ -319,10 +322,10 @@ func TestLoginOIDCCommand(t *testing.T) {
 			wantOptionsCount: 12,
 			wantStdout:       `{"kind":"ExecCredential","apiVersion":"client.authentication.k8s.io/v1beta1","spec":{"interactive":false},"status":{"token":"exchanged-token"}}` + "\n",
 			wantLogs: []string{
-				nowStr + `  cmd/login_oidc.go:268  Performing OIDC login  {"issuer": "test-issuer", "client id": "test-client-id"}`,
-				nowStr + `  cmd/login_oidc.go:278  Exchanging token for cluster credential  {"endpoint": "https://127.0.0.1:1234/", "authenticator type": "webhook", "authenticator name": "test-authenticator"}`,
-				nowStr + `  cmd/login_oidc.go:286  Successfully exchanged token for cluster credential.`,
-				nowStr + `  cmd/login_oidc.go:293  caching cluster credential for future use.`,
+				nowStr + `  cmd/login_oidc.go:280  Performing OIDC login  {"issuer": "test-issuer", "client id": "test-client-id"}`,
+				nowStr + `  cmd/login_oidc.go:301  Exchanging token for cluster credential  {"endpoint": "https://127.0.0.1:1234/", "authenticator type": "webhook", "authenticator name": "test-authenticator"}`,
+				nowStr + `  cmd/login_oidc.go:309  Successfully exchanged token for cluster credential.`,
+				nowStr + `  cmd/login_oidc.go:316  caching cluster credential for future use.`,
 			},
 		},
 	}
@@ -380,7 +383,10 @@ func TestLoginOIDCCommand(t *testing.T) {
 			var stdout, stderr bytes.Buffer
 			cmd.SetOut(&stdout)
 			cmd.SetErr(&stderr)
-			cmd.SetArgs(tt.args)
+			// The login takes a lock file that lives next to the session cache file. Always use a session cache in a
+			// temp directory, so that running these tests never creates a lock file in the user's real config directory.
+			args := append(append([]string{}, tt.args...), "--session-cache", filepath.Join(t.TempDir(), "sessions.yaml"))
+			cmd.SetArgs(args)
 			err = cmd.ExecuteContext(ctx)
 			if tt.wantError {
 				require.Error(t, err)
@@ -394,4 +400,148 @@ func TestLoginOIDCCommand(t *testing.T) {
 			require.Equal(t, tt.wantLogs, testutil.SplitByNewline(buf.String()))
 		})
 	}
+}
+
+func TestLockIssuerLogin(t *testing.T) {
+	const issuerA = "https://issuer-a.example.com"
+	const issuerB = "https://issuer-b.example.com"
+
+	t.Run("a second login to the same issuer waits until the first one releases the lock", func(t *testing.T) {
+		sessionCachePath := filepath.Join(t.TempDir(), "sessions.yaml")
+
+		unlockFirst, acquired := lockIssuerLogin(context.Background(), sessionCachePath, issuerA, time.Minute, plog.New())
+		require.True(t, acquired)
+
+		secondGotLock := make(chan struct{})
+		go func() {
+			unlockSecond, acquired := lockIssuerLogin(context.Background(), sessionCachePath, issuerA, time.Minute, plog.New())
+			if acquired {
+				close(secondGotLock)
+				unlockSecond()
+			}
+		}()
+
+		// While the first login holds the lock, the second one must keep waiting.
+		select {
+		case <-secondGotLock:
+			t.Fatal("the second login got the lock while the first login still held it")
+		case <-time.After(500 * time.Millisecond):
+		}
+
+		unlockFirst()
+
+		select {
+		case <-secondGotLock:
+		case <-time.After(10 * time.Second):
+			t.Fatal("the second login never got the lock after the first login released it")
+		}
+	})
+
+	t.Run("logins to different issuers do not wait for each other", func(t *testing.T) {
+		sessionCachePath := filepath.Join(t.TempDir(), "sessions.yaml")
+
+		unlockA, acquiredA := lockIssuerLogin(context.Background(), sessionCachePath, issuerA, time.Second, plog.New())
+		require.True(t, acquiredA)
+		defer unlockA()
+
+		// If issuer B wrongly shared issuer A's lock, this would wait the full second and then report not acquired.
+		unlockB, acquiredB := lockIssuerLogin(context.Background(), sessionCachePath, issuerB, time.Second, plog.New())
+		require.True(t, acquiredB)
+		defer unlockB()
+	})
+
+	t.Run("stops waiting after the timeout and carries on without the lock", func(t *testing.T) {
+		sessionCachePath := filepath.Join(t.TempDir(), "sessions.yaml")
+
+		unlockFirst, acquired := lockIssuerLogin(context.Background(), sessionCachePath, issuerA, time.Minute, plog.New())
+		require.True(t, acquired)
+
+		unlockSecond, acquired := lockIssuerLogin(context.Background(), sessionCachePath, issuerA, 200*time.Millisecond, plog.New())
+		require.False(t, acquired)
+
+		// Releasing a lock that was never acquired must not release the first login's lock.
+		unlockSecond()
+		_, acquired = lockIssuerLogin(context.Background(), sessionCachePath, issuerA, 200*time.Millisecond, plog.New())
+		require.False(t, acquired, "the first login should still hold the lock")
+
+		unlockFirst()
+		unlockThird, acquired := lockIssuerLogin(context.Background(), sessionCachePath, issuerA, time.Second, plog.New())
+		require.True(t, acquired)
+		unlockThird()
+	})
+
+	t.Run("creates the session cache directory when it does not exist yet", func(t *testing.T) {
+		cacheDir := filepath.Join(t.TempDir(), "does", "not", "exist")
+
+		unlock, acquired := lockIssuerLogin(context.Background(), filepath.Join(cacheDir, "sessions.yaml"), issuerA, time.Second, plog.New())
+		require.True(t, acquired)
+		unlock()
+
+		require.DirExists(t, cacheDir)
+	})
+
+	t.Run("does nothing when there is no session cache path", func(t *testing.T) {
+		unlock, acquired := lockIssuerLogin(context.Background(), "", issuerA, time.Second, plog.New())
+		require.False(t, acquired)
+		unlock()
+	})
+}
+
+// This runs the real login command, so it checks that the lock is actually used by the command.
+func TestLoginOIDCCommandTakesTurnsPerIssuer(t *testing.T) {
+	// Starts one login command for each issuer in the list, all at the same moment, like k9s does for the
+	// contexts in a kubeconfig. Returns the highest number of logins that were running at the same time.
+	runAllAtOnce := func(t *testing.T, issuers []string) int32 {
+		sessionCachePath := filepath.Join(t.TempDir(), "sessions.yaml")
+		var runningNow, mostAtOnce atomic.Int32
+		var wg sync.WaitGroup
+
+		for _, issuer := range issuers {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+
+				cmd := oidcLoginCommand(oidcLoginCommandDeps{
+					lookupEnv: func(string) (string, bool) { return "", false },
+					login: func(string, string, ...oidcclient.Option) (*oidctypes.Token, error) {
+						now := runningNow.Add(1)
+						for {
+							highest := mostAtOnce.Load()
+							if now <= highest || mostAtOnce.CompareAndSwap(highest, now) {
+								break
+							}
+						}
+						time.Sleep(500 * time.Millisecond) // pretend to wait for the user in the browser
+						runningNow.Add(-1)
+
+						return &oidctypes.Token{
+							IDToken: &oidctypes.IDToken{Token: "test-id-token", Expiry: metav1.NewTime(time.Now().Add(time.Hour))},
+						}, nil
+					},
+					optionsFactory: &clientOptions{},
+				})
+				cmd.SetOut(&bytes.Buffer{})
+				cmd.SetErr(&bytes.Buffer{})
+				cmd.SetArgs([]string{
+					"--issuer", issuer,
+					"--session-cache", sessionCachePath,
+					"--credential-cache", "", // must specify --credential-cache or else the cache file on disk causes test pollution
+				})
+				assert.NoError(t, cmd.ExecuteContext(context.Background()))
+			}()
+		}
+
+		wg.Wait()
+		return mostAtOnce.Load()
+	}
+
+	t.Run("logins to the same issuer run one at a time", func(t *testing.T) {
+		sameIssuer := []string{"https://issuer-a.example.com", "https://issuer-a.example.com", "https://issuer-a.example.com", "https://issuer-a.example.com"}
+		require.Equal(t, int32(1), runAllAtOnce(t, sameIssuer))
+	})
+
+	t.Run("logins to different issuers run at the same time", func(t *testing.T) {
+		differentIssuers := []string{"https://issuer-a.example.com", "https://issuer-b.example.com", "https://issuer-c.example.com"}
+		require.Greater(t, runAllAtOnce(t, differentIssuers), int32(1))
+	})
 }
